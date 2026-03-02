@@ -1,0 +1,542 @@
+#!/usr/bin/env bun
+import { $ } from "bun";
+import { chmod, mkdir, stat } from "node:fs/promises";
+import { join, dirname } from "node:path";
+
+const SCRIPT_DIR = dirname(Bun.main);
+const ENV_FILE = join(SCRIPT_DIR, ".env");
+const DATA_DIR = join(SCRIPT_DIR, "data");
+const SERVICE_DIR = join(SCRIPT_DIR, "service");
+const LAUNCH_SCRIPT = join(SERVICE_DIR, "launch.sh");
+const SERVICE_LOG = join(SERVICE_DIR, "openfang.log");
+
+// launchd (macOS)
+const PLIST_LABEL = "com.openfang.docker";
+const PLIST_DIR = join(process.env.HOME!, "Library", "LaunchAgents");
+const PLIST_PATH = join(PLIST_DIR, `${PLIST_LABEL}.plist`);
+
+// systemd (Linux)
+const SYSTEMD_UNIT = "openfang.service";
+const SYSTEMD_DIR = join(process.env.HOME!, ".config", "systemd", "user");
+const SYSTEMD_PATH = join(SYSTEMD_DIR, SYSTEMD_UNIT);
+
+const log = {
+  info: (msg: string) => console.log(`\x1b[36m[INFO]\x1b[0m ${msg}`),
+  ok: (msg: string) => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`),
+  warn: (msg: string) => console.log(`\x1b[33m[WARN]\x1b[0m ${msg}`),
+  error: (msg: string) => console.error(`\x1b[31m[ERROR]\x1b[0m ${msg}`),
+};
+
+// --- Detect bind IP: .env BIND_IP → Tailscale → localhost ---
+async function detectBindIp(): Promise<string> {
+  // 1. Explicit BIND_IP from .env takes priority
+  const envFile = Bun.file(ENV_FILE);
+  if (await envFile.exists()) {
+    const content = await envFile.text();
+    const match = content.match(/^BIND_IP=(.+)$/m);
+    if (match) {
+      const ip = match[1].trim();
+      if (ip) {
+        log.info(`Using BIND_IP from .env: ${ip}`);
+        return ip;
+      }
+    }
+  }
+
+  // 2. Try Tailscale auto-detection
+  try {
+    const result = await $`tailscale ip -4`.nothrow().quiet();
+    const ip = result.text().trim();
+    if (result.exitCode === 0 && ip) return ip;
+  } catch {}
+
+  // 3. Fallback to localhost
+  return "127.0.0.1";
+}
+
+// --- Preflight checks ---
+async function preflight(): Promise<void> {
+  let failed = false;
+
+  // Check Docker image exists
+  const imgCheck = await $`docker image inspect openfang:latest`.nothrow().quiet();
+  if (imgCheck.exitCode !== 0) {
+    log.error("Image 'openfang:latest' not found. Run './build' first.");
+    failed = true;
+  }
+
+  // Check .env exists and permissions
+  const envFile = Bun.file(ENV_FILE);
+  if (!(await envFile.exists())) {
+    log.error(".env file not found. Create it with your API keys.");
+    console.log("  Example: cp .env.example .env && chmod 600 .env");
+    failed = true;
+  } else {
+    const envStat = await stat(ENV_FILE);
+    const perms = (envStat.mode & 0o777).toString(8);
+    if (perms !== "600") {
+      log.warn(`.env has loose permissions (${perms}). Fixing to 600.`);
+      await chmod(ENV_FILE, 0o600);
+    }
+    const content = await envFile.text();
+    if (!/^OPENFANG_API_KEY=.+/m.test(content)) {
+      log.error("OPENFANG_API_KEY not set in .env. Run './build' to generate one.");
+      failed = true;
+    }
+  }
+
+  // Check data dir + config
+  const configFile = Bun.file(join(DATA_DIR, "config.toml"));
+  if (!(await configFile.exists())) {
+    log.error("data/config.toml not found. Run './build' first.");
+    failed = true;
+  }
+
+  if (failed) process.exit(1);
+}
+
+// --- Show current image version ---
+async function showVersion(): Promise<void> {
+  const result = await $`docker image inspect openfang:latest --format '{{join .RepoTags ", "}}'`.nothrow().quiet();
+  const tags = result.exitCode === 0 ? result.text().trim() : "unknown";
+  log.info(`Image: ${tags}`);
+}
+
+// --- Health check using fetch ---
+async function healthCheck(bindIp: string): Promise<boolean> {
+  const url = `http://${bindIp}:4200/api/health`;
+  log.info(`Waiting for health check (${url})...`);
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) {
+        log.ok("OpenFang is healthy");
+        return true;
+      }
+      lastError = new Error(`HTTP ${resp.status}`);
+    } catch (e) {
+      lastError = e;
+    }
+    await Bun.sleep(2000);
+  }
+
+  log.warn("Health check timed out after 60s");
+  if (lastError instanceof Error) log.warn(`Last error: ${lastError.message}`);
+  log.warn("Check logs: ./up logs");
+  return false;
+}
+
+// --- Container commands ---
+async function cmdUp(): Promise<void> {
+  await preflight();
+  await showVersion();
+
+  const bindIp = await detectBindIp();
+  process.env.BIND_IP = bindIp;
+  log.info(`Binding to: ${bindIp}:4200`);
+
+  log.info("Starting OpenFang...");
+  await $`docker compose up -d`.cwd(SCRIPT_DIR).env({ ...process.env, BIND_IP: bindIp });
+
+  await healthCheck(bindIp);
+  console.log("");
+  log.ok(`OpenFang is running at \x1b[36mhttp://${bindIp}:4200\x1b[0m`);
+  console.log("");
+}
+
+async function cmdDown(): Promise<void> {
+  log.info("Stopping OpenFang...");
+  await $`docker compose down`.cwd(SCRIPT_DIR);
+  log.ok("Stopped");
+}
+
+async function cmdRestart(): Promise<void> {
+  await preflight();
+  await showVersion();
+
+  const bindIp = await detectBindIp();
+  log.info(`Binding to: ${bindIp}:4200`);
+
+  log.info("Restarting OpenFang...");
+  await $`docker compose down`.cwd(SCRIPT_DIR);
+  await $`docker compose up -d`.cwd(SCRIPT_DIR).env({ ...process.env, BIND_IP: bindIp });
+
+  await healthCheck(bindIp);
+  console.log("");
+  log.ok(`OpenFang is running at \x1b[36mhttp://${bindIp}:4200\x1b[0m`);
+  console.log("");
+}
+
+async function cmdLogs(): Promise<void> {
+  await $`docker compose logs -f`.cwd(SCRIPT_DIR);
+}
+
+async function cmdStatus(): Promise<void> {
+  const result = await $`docker compose ps --status running`.cwd(SCRIPT_DIR).nothrow().quiet();
+  if (result.exitCode !== 0) {
+    log.error("Failed to query container status. Is Docker running?");
+    process.exit(1);
+  }
+  if (result.text().includes("openfang")) {
+    log.ok("OpenFang is running");
+    await $`docker compose ps`.cwd(SCRIPT_DIR);
+  } else {
+    log.warn("OpenFang is not running");
+  }
+}
+
+// --- Generate launch.sh (shared by launchd and systemd) ---
+async function generateLaunchScript(): Promise<void> {
+  await mkdir(SERVICE_DIR, { recursive: true });
+
+  const script = `#!/bin/sh
+# Auto-generated by up — checks BIND_IP, waits for Tailscale + Docker, then starts OpenFang
+
+# Ensure bun is in PATH (boot-time PATH is minimal)
+export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+LOG="${SERVICE_LOG}"
+ENVFILE="${join(SCRIPT_DIR, ".env")}"
+echo "$(date): OpenFang launch script started" >> "$LOG"
+
+# Check if BIND_IP is explicitly set in .env — if so, skip Tailscale wait
+BIND_IP=""
+if [ -f "$ENVFILE" ]; then
+    BIND_IP=$(grep -E '^BIND_IP=.+' "$ENVFILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' ')
+fi
+
+if [ -z "$BIND_IP" ]; then
+    # Wait for Tailscale (up to 5 minutes)
+    attempts=0
+    while ! tailscale ip -4 >/dev/null 2>&1; do
+        if [ $attempts -ge 60 ]; then
+            echo "$(date): Tailscale not available after 5 minutes, starting with localhost" >> "$LOG"
+            break
+        fi
+        sleep 5
+        attempts=$((attempts + 1))
+    done
+else
+    echo "$(date): BIND_IP set in .env ($BIND_IP), skipping Tailscale wait" >> "$LOG"
+fi
+
+# Wait for Docker (up to 2 minutes)
+attempts=0
+while ! docker info >/dev/null 2>&1; do
+    if [ $attempts -ge 24 ]; then
+        echo "$(date): Docker not available after 2 minutes, aborting" >> "$LOG"
+        exit 1
+    fi
+    sleep 5
+    attempts=$((attempts + 1))
+done
+
+echo "$(date): Dependencies ready, starting OpenFang..." >> "$LOG"
+cd "${SCRIPT_DIR}"
+./up up >> "$LOG" 2>&1
+echo "$(date): OpenFang started" >> "$LOG"
+`;
+
+  await Bun.write(LAUNCH_SCRIPT, script);
+  await chmod(LAUNCH_SCRIPT, 0o755);
+}
+
+// --- macOS launchd ---
+async function installLaunchd(): Promise<void> {
+  await generateLaunchScript();
+  log.ok(`Created: ${LAUNCH_SCRIPT}`);
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${LAUNCH_SCRIPT}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${SERVICE_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>${SERVICE_LOG}</string>
+</dict>
+</plist>`;
+
+  await mkdir(PLIST_DIR, { recursive: true });
+  await Bun.write(PLIST_PATH, plist);
+  log.ok(`Created: ${PLIST_PATH}`);
+
+  const uid = (await $`id -u`.text()).trim();
+  await $`launchctl bootout gui/${uid}/${PLIST_LABEL}`.nothrow().quiet();
+  await $`launchctl bootstrap gui/${uid} ${PLIST_PATH}`;
+
+  log.ok("launchd service installed and loaded");
+  log.info("OpenFang will auto-start on login");
+}
+
+async function uninstallLaunchd(): Promise<void> {
+  const uid = (await $`id -u`.text()).trim();
+  await $`launchctl bootout gui/${uid}/${PLIST_LABEL}`.nothrow().quiet();
+  log.ok("Service unloaded");
+
+  const plistFile = Bun.file(PLIST_PATH);
+  if (await plistFile.exists()) {
+    await $`rm ${PLIST_PATH}`;
+    log.ok(`Removed: ${PLIST_PATH}`);
+  }
+
+  const launchFile = Bun.file(LAUNCH_SCRIPT);
+  if (await launchFile.exists()) {
+    await $`rm ${LAUNCH_SCRIPT}`;
+    log.ok(`Removed: ${LAUNCH_SCRIPT}`);
+  }
+
+  log.ok("launchd service uninstalled");
+}
+
+async function statusLaunchd(): Promise<void> {
+  const uid = (await $`id -u`.text()).trim();
+  const result = await $`launchctl print gui/${uid}/${PLIST_LABEL}`.nothrow().quiet();
+  if (result.exitCode === 0) {
+    log.ok("launchd service is registered");
+    const lines = result.text().split("\n").filter((l) =>
+      /state|pid|last exit/i.test(l)
+    );
+    for (const line of lines) console.log(`  ${line.trim()}`);
+  } else {
+    log.warn("launchd service is not registered. Run: ./up install");
+  }
+}
+
+// --- Linux systemd (user service) ---
+async function installSystemd(): Promise<void> {
+  await generateLaunchScript();
+  log.ok(`Created: ${LAUNCH_SCRIPT}`);
+
+  const unit = `[Unit]
+Description=OpenFang Docker Container
+After=network-online.target tailscaled.service docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${LAUNCH_SCRIPT}
+ExecStop=${join(SCRIPT_DIR, "up")} down
+WorkingDirectory=${SCRIPT_DIR}
+
+[Install]
+WantedBy=default.target
+`;
+
+  await mkdir(SYSTEMD_DIR, { recursive: true });
+  await Bun.write(SYSTEMD_PATH, unit);
+  log.ok(`Created: ${SYSTEMD_PATH}`);
+
+  await $`systemctl --user daemon-reload`;
+  await $`systemctl --user enable ${SYSTEMD_UNIT}`;
+
+  log.ok("systemd user service installed and enabled");
+  log.info("OpenFang will auto-start on login");
+  log.info("For boot-time start without login: loginctl enable-linger $USER");
+  log.info("Start now: systemctl --user start openfang");
+}
+
+async function uninstallSystemd(): Promise<void> {
+  await $`systemctl --user stop ${SYSTEMD_UNIT}`.nothrow().quiet();
+  await $`systemctl --user disable ${SYSTEMD_UNIT}`.nothrow().quiet();
+  log.ok("Service stopped and disabled");
+
+  const unitFile = Bun.file(SYSTEMD_PATH);
+  if (await unitFile.exists()) {
+    await $`rm ${SYSTEMD_PATH}`;
+    log.ok(`Removed: ${SYSTEMD_PATH}`);
+  }
+  await $`systemctl --user daemon-reload`;
+
+  const launchFile = Bun.file(LAUNCH_SCRIPT);
+  if (await launchFile.exists()) {
+    await $`rm ${LAUNCH_SCRIPT}`;
+    log.ok(`Removed: ${LAUNCH_SCRIPT}`);
+  }
+
+  log.ok("systemd service uninstalled");
+}
+
+async function statusSystemd(): Promise<void> {
+  const result = await $`systemctl --user status ${SYSTEMD_UNIT}`.nothrow().quiet();
+  if (result.exitCode <= 3) {
+    console.log(result.text());
+  } else {
+    log.warn("systemd service is not registered. Run: ./up install");
+  }
+}
+
+// --- Platform-dispatched service commands ---
+async function cmdInstall(): Promise<void> {
+  if (process.platform === "darwin") {
+    await installLaunchd();
+  } else if (process.platform === "linux") {
+    await installSystemd();
+  } else {
+    log.error(`Unsupported platform for service management: ${process.platform}`);
+    process.exit(1);
+  }
+  log.info("View logs: ./up service-logs");
+}
+
+async function cmdUninstall(): Promise<void> {
+  if (process.platform === "darwin") {
+    await uninstallLaunchd();
+  } else if (process.platform === "linux") {
+    await uninstallSystemd();
+  } else {
+    log.error(`Unsupported platform: ${process.platform}`);
+    process.exit(1);
+  }
+}
+
+async function cmdServiceStatus(): Promise<void> {
+  if (process.platform === "darwin") {
+    await statusLaunchd();
+  } else if (process.platform === "linux") {
+    await statusSystemd();
+  } else {
+    log.error(`Unsupported platform: ${process.platform}`);
+    process.exit(1);
+  }
+}
+
+async function cmdServiceLogs(): Promise<void> {
+  const logFile = Bun.file(SERVICE_LOG);
+  if (await logFile.exists()) {
+    await $`tail -f ${SERVICE_LOG}`;
+  } else {
+    log.warn(`No service log found at ${SERVICE_LOG}`);
+  }
+}
+
+// --- Lifecycle commands ---
+async function cmdShutdown(): Promise<void> {
+  log.info("Shutting down OpenFang completely...");
+
+  await $`docker compose down`.cwd(SCRIPT_DIR).nothrow().quiet();
+  log.ok("Container stopped");
+
+  if (process.platform === "darwin") {
+    if (await Bun.file(PLIST_PATH).exists()) {
+      await uninstallLaunchd();
+    } else {
+      log.info("No launchd service installed — skipping");
+    }
+  } else if (process.platform === "linux") {
+    if (await Bun.file(SYSTEMD_PATH).exists()) {
+      await uninstallSystemd();
+    } else {
+      log.info("No systemd service installed — skipping");
+    }
+  }
+
+  log.ok("Shutdown complete. OpenFang will not auto-start on reboot.");
+}
+
+async function cmdCleanup(): Promise<void> {
+  const all = process.argv.includes("--all");
+
+  // Stop everything first
+  await $`docker compose down`.cwd(SCRIPT_DIR).nothrow().quiet();
+  log.ok("Container stopped");
+
+  // Uninstall service if present
+  if (process.platform === "darwin" && (await Bun.file(PLIST_PATH).exists())) {
+    await uninstallLaunchd();
+  } else if (process.platform === "linux" && (await Bun.file(SYSTEMD_PATH).exists())) {
+    await uninstallSystemd();
+  }
+
+  // Remove Docker images
+  log.info("Removing openfang Docker images...");
+  const imageIds = (await $`docker images openfang -q`.nothrow().quiet().text()).trim();
+  if (imageIds) {
+    for (const id of imageIds.split("\n").filter(Boolean)) {
+      await $`docker rmi -f ${id}`.nothrow().quiet();
+    }
+    log.ok("Docker images removed");
+  } else {
+    log.info("No openfang images found");
+  }
+
+  // Remove service/
+  await $`rm -rf ${SERVICE_DIR}`.nothrow().quiet();
+  log.ok("Removed service/");
+
+  if (all) {
+    const answer = prompt("\x1b[33mThis will delete ALL persistent data in data/. Type 'yes' to confirm:\x1b[0m ");
+    if (answer !== "yes") {
+      log.info("Aborted. data/ was not removed.");
+      return;
+    }
+    await $`rm -rf ${DATA_DIR}`;
+    log.ok("Removed data/");
+  }
+
+  log.ok("Cleanup complete");
+}
+
+function usage(): void {
+  console.log("Usage: ./up [command]\n");
+  console.log("Container:");
+  console.log("  up              Start container (default)");
+  console.log("  down            Stop container");
+  console.log("  restart         Stop and start container");
+  console.log("  logs            Tail container logs");
+  console.log("  status          Show container status");
+  console.log("");
+  console.log("Service (auto-start):");
+  console.log("  install         Register auto-start (launchd on macOS, systemd on Linux)");
+  console.log("  uninstall       Remove auto-start");
+  console.log("  service-status  Show service status");
+  console.log("  service-logs    Tail service startup logs");
+  console.log("");
+  console.log("Lifecycle:");
+  console.log("  shutdown        Stop container + remove auto-start service");
+  console.log("  cleanup         shutdown + remove Docker images + service/");
+  console.log("  cleanup --all   Also delete data/ (with confirmation)");
+  console.log("");
+}
+
+// --- Main dispatcher ---
+const command = process.argv[2] ?? "up";
+
+const commands: Record<string, () => Promise<void> | void> = {
+  up: cmdUp,
+  down: cmdDown,
+  restart: cmdRestart,
+  logs: cmdLogs,
+  status: cmdStatus,
+  install: cmdInstall,
+  uninstall: cmdUninstall,
+  "service-status": cmdServiceStatus,
+  "service-logs": cmdServiceLogs,
+  shutdown: cmdShutdown,
+  cleanup: cmdCleanup,
+  "-h": usage,
+  "--help": usage,
+};
+
+const handler = commands[command];
+if (!handler) {
+  log.error(`Unknown command: ${command}`);
+  usage();
+  process.exit(1);
+}
+
+Promise.resolve(handler()).catch((e) => {
+  log.error(e.message);
+  process.exit(1);
+});

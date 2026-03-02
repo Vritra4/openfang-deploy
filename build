@@ -1,0 +1,145 @@
+#!/usr/bin/env bun
+import { $ } from "bun";
+import { mkdir, chmod, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { join, dirname } from "node:path";
+import * as semver from "semver";
+import * as TOML from "smol-toml";
+
+const SCRIPT_DIR = dirname(Bun.main);
+const REPO_DIR = join(SCRIPT_DIR, "openfang");
+const DATA_DIR = join(SCRIPT_DIR, "data");
+const ENV_FILE = join(SCRIPT_DIR, ".env");
+
+const log = {
+  info: (msg: string) => console.log(`\x1b[36m[INFO]\x1b[0m ${msg}`),
+  ok: (msg: string) => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`),
+  warn: (msg: string) => console.log(`\x1b[33m[WARN]\x1b[0m ${msg}`),
+  error: (msg: string) => console.error(`\x1b[31m[ERROR]\x1b[0m ${msg}`),
+};
+
+async function dirExists(path: string): Promise<boolean> {
+  try {
+    const s = await stat(path);
+    return s.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function initData(): Promise<void> {
+  if (!(await dirExists(DATA_DIR))) {
+    log.info(`Creating data directory: ${DATA_DIR}`);
+    await mkdir(DATA_DIR, { recursive: true, mode: 0o700 });
+  }
+
+  const configPath = join(DATA_DIR, "config.toml");
+  const configFile = Bun.file(configPath);
+  if (!(await configFile.exists())) {
+    log.info(`Generating default config: ${configPath}`);
+    const defaultConfig = {
+      home_dir: "/data",
+      data_dir: "/data/db",
+      log_level: "info",
+      api_listen: "0.0.0.0:4200",
+      memory: { decay_rate: 0.05 },
+    };
+    const header =
+      "# OpenFang configuration for Docker deployment\n" +
+      "# api_key is injected at runtime from .env (OPENFANG_API_KEY)\n\n";
+    await Bun.write(configPath, header + TOML.stringify(defaultConfig));
+    await chmod(configPath, 0o600);
+    log.ok("Default config created (no secrets — api_key injected at runtime)");
+  }
+
+  const envFile = Bun.file(ENV_FILE);
+  if (await envFile.exists()) {
+    const content = await envFile.text();
+    if (/^OPENFANG_API_KEY=\s*$/m.test(content)) {
+      // Replace empty placeholder with generated key
+      const apiKey = randomBytes(24).toString("hex");
+      const updated = content.replace(/^OPENFANG_API_KEY=\s*$/m, `OPENFANG_API_KEY=${apiKey}`);
+      await Bun.write(ENV_FILE, updated);
+      await chmod(ENV_FILE, 0o600);
+      log.ok("Generated OPENFANG_API_KEY in .env");
+    } else if (!/^OPENFANG_API_KEY=.+/m.test(content)) {
+      // Key line absent entirely — append
+      const apiKey = randomBytes(24).toString("hex");
+      await Bun.write(ENV_FILE, content.trimEnd() + `\nOPENFANG_API_KEY=${apiKey}\n`);
+      await chmod(ENV_FILE, 0o600);
+      log.ok("Generated OPENFANG_API_KEY and appended to .env");
+    }
+  } else {
+    log.warn(".env not found. Create it before running ./up:");
+    log.warn("  cp .env.example .env && chmod 600 .env");
+  }
+}
+
+async function pullRepo(): Promise<void> {
+  log.info("Updating submodule...");
+  await $`git submodule update --init openfang`.cwd(SCRIPT_DIR);
+
+  log.info("Fetching latest tags from upstream...");
+  await $`git fetch --tags --prune --prune-tags`.cwd(REPO_DIR);
+}
+
+async function findLatestStableTag(): Promise<string> {
+  const tagsRaw = (await $`git tag -l 'v*'`.cwd(REPO_DIR).text()).trim();
+  if (!tagsRaw) {
+    log.error("No tags found in repository");
+    process.exit(1);
+  }
+
+  const stableTags = tagsRaw
+    .split("\n")
+    .map((t) => t.trim().replace(/^v/, ""))
+    .filter((t) => semver.valid(t) && !semver.prerelease(t));
+
+  if (stableTags.length === 0) {
+    log.error("No stable release tags found (all have pre-release suffixes)");
+    process.exit(1);
+  }
+
+  const sorted = semver.rsort([...stableTags]);
+  return `v${sorted[0]}`;
+}
+
+async function buildImages(tag: string): Promise<void> {
+  const dockerCheck = await $`docker info`.nothrow().quiet();
+  if (dockerCheck.exitCode !== 0) {
+    log.error("Docker is not running. Start Docker first.");
+    process.exit(1);
+  }
+
+  log.info(`Checking out tag: ${tag}`);
+  await $`git checkout ${tag} --quiet`.cwd(REPO_DIR);
+
+  log.info("Building base image: openfang:base");
+  await $`docker build -t openfang:base -f Dockerfile .`.cwd(REPO_DIR);
+
+  log.info(`Building wrapper image: openfang:${tag}`);
+  await $`docker build -t openfang:${tag} -t openfang:latest .`.cwd(SCRIPT_DIR);
+
+  log.ok(`Images built: openfang:${tag} (also tagged as openfang:latest)`);
+}
+
+async function main(): Promise<void> {
+  console.log("\n\x1b[36m=== OpenFang Docker Build ===\x1b[0m\n");
+
+  await initData();
+  await pullRepo();
+
+  const tag = await findLatestStableTag();
+  log.ok(`Latest stable release: ${tag}`);
+
+  await buildImages(tag);
+
+  console.log("");
+  log.ok("Build complete. Run \x1b[36m./up\x1b[0m to start the container.");
+  console.log("");
+}
+
+main().catch((e) => {
+  log.error(e.message);
+  process.exit(1);
+});

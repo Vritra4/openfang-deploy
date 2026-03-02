@@ -1,0 +1,11 @@
+services:
+  openfang:
+    image: openfang:latest
+    container_name: openfang
+    ports:
+      - "${BIND_IP:-127.0.0.1}:4200:4200"
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+    restart: unless-stopped

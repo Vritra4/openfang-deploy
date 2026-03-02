@@ -44,8 +44,12 @@ async function detectBindIp(): Promise<string> {
   }
 
   // 2. Try Tailscale auto-detection
+  const tailscaleBin =
+    process.platform === "darwin"
+      ? "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+      : "tailscale";
   try {
-    const result = await $`tailscale ip -4`.nothrow().quiet();
+    const result = await $`${tailscaleBin} ip -4`.nothrow().quiet();
     const ip = result.text().trim();
     if (result.exitCode === 0 && ip) return ip;
   } catch {}
@@ -208,9 +212,15 @@ if [ -f "$ENVFILE" ]; then
 fi
 
 if [ -z "$BIND_IP" ]; then
+    # Tailscale binary path (macOS App Store vs Linux package)
+    if [ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]; then
+        TAILSCALE="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    else
+        TAILSCALE="tailscale"
+    fi
     # Wait for Tailscale (up to 5 minutes)
     attempts=0
-    while ! tailscale ip -4 >/dev/null 2>&1; do
+    while ! "$TAILSCALE" ip -4 >/dev/null 2>&1; do
         if [ $attempts -ge 60 ]; then
             echo "$(date): Tailscale not available after 5 minutes, starting with localhost" >> "$LOG"
             break
@@ -483,6 +493,15 @@ async function cmdCleanup(): Promise<void> {
     }
     await $`rm -rf ${DATA_DIR}`;
     log.ok("Removed data/");
+
+    // Clear API key so build regenerates it
+    const envFile = Bun.file(ENV_FILE);
+    if (await envFile.exists()) {
+      const content = await envFile.text();
+      const updated = content.replace(/^OPENFANG_API_KEY=.+$/m, "OPENFANG_API_KEY=");
+      await Bun.write(ENV_FILE, updated);
+      log.ok("Cleared OPENFANG_API_KEY in .env");
+    }
   }
 
   log.ok("Cleanup complete");
